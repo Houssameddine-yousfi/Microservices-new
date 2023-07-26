@@ -14,6 +14,8 @@ import com.json.orderservice.model.Order;
 import com.json.orderservice.model.OrderLineItems;
 import com.json.orderservice.repository.OrderRepository;
 
+import brave.Span;
+import brave.Tracer;
 import lombok.RequiredArgsConstructor;
 
 @Service
@@ -22,6 +24,7 @@ public class OrderService {
 
     private final OrderRepository orderRepository;
     private final WebClient.Builder webClientBuilder;
+    private final Tracer tracer;
     
     public String placeOrder(OrderRequest orderRequest){
         Order order = new Order();
@@ -39,22 +42,28 @@ public class OrderService {
         ).toList();
 
 
-        // check availability in inventory service
-        InventoryResponce[] inventoryResponces = webClientBuilder.build().get()
-            .uri("http://inventory-service/api/inventory",
-                    uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
-            .retrieve()
-            .bodyToMono(InventoryResponce[].class)
-            .block();
+        Span inventoryServiceLookup = tracer.nextSpan().name("InventoryServiceLookup");
+        try (Tracer.SpanInScope spanInScope = tracer.withSpanInScope(inventoryServiceLookup.start())) {
+            // check availability in inventory service
+            InventoryResponce[] inventoryResponces = webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory",
+                            uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
+                    .retrieve()
+                    .bodyToMono(InventoryResponce[].class)
+                    .block();
 
-        boolean allProductInStock = Arrays.stream(inventoryResponces).allMatch(InventoryResponce::isInStock);
+            boolean allProductInStock = Arrays.stream(inventoryResponces).allMatch(InventoryResponce::isInStock);
 
-        if(allProductInStock){
-            orderRepository.save(order);
-            return "Order placed succesfully";
-        } else {
-            throw new IllegalArgumentException("Product is not in stock, please try later");
+            if (allProductInStock) {
+                orderRepository.save(order);
+                return "Order placed succesfully";
+            } else {
+                throw new IllegalArgumentException("Product is not in stock, please try later");
+            }
+        } finally {
+            inventoryServiceLookup.finish();
         }
+        
     }
 
     private OrderLineItems mapFromDto(OrderLineItemsDto orderLineItemsDto){
